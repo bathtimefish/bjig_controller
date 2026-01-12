@@ -227,6 +227,10 @@ module.control(&json!({"clear_counts": "all"})).await?;
 
 ### モニターコマンド
 
+モニターコマンドは、ルーターからのJSON形式のアップリンクデータをリアルタイムでストリーミングします。
+
+#### 基本的な使い方
+
 ```rust
 // 無期限で監視（Ctrl+Cまで）
 bjig.monitor().start().await?;
@@ -234,6 +238,49 @@ bjig.monitor().start().await?;
 // タイムアウト付きで監視（60秒間）
 bjig.monitor().start_with_ttl(60).await?;
 ```
+
+#### コールバックを使った高度な使い方
+
+監視プロセスをより細かく制御するために、到着した各JSON行を処理できるコールバックベースのメソッドを使用できます：
+
+```rust
+// 各JSON行を収集して処理
+let mut json_list: Vec<String> = Vec::new();
+
+bjig.monitor().start_with_callback(|line| {
+    // 各行を即座に表示
+    println!("受信: {}", line);
+
+    // コレクションに追加
+    json_list.push(line.to_string());
+
+    // Ok(true)で継続、Ok(false)で停止
+    Ok(json_list.len() < 5)  // 5件で停止
+}).await?;
+
+println!("{}件を収集しました", json_list.len());
+```
+
+```rust
+// タイムアウトとコールバック併用
+let mut json_list: Vec<String> = Vec::new();
+
+bjig.monitor().start_with_ttl_and_callback(120, |line| {
+    println!("受信: {}", line);
+    json_list.push(line.to_string());
+    Ok(json_list.len() < 5)  // 5件または120秒で停止
+}).await?;
+```
+
+**コールバックメソッド:**
+- `start_with_callback(callback)` - コールバック付き監視、タイムアウトなし
+- `start_with_callback_on(port, baud, callback)` - 特定のポートでコールバック付き監視
+- `start_with_ttl_and_callback(ttl_secs, callback)` - タイムアウトとコールバック併用
+
+コールバック関数は各JSON行を`&str`として受け取り、`Result<bool>`を返す必要があります：
+- `Ok(true)`を返すと監視を継続
+- `Ok(false)`を返すと監視を停止してプロセスを終了
+- `Err(e)`を返すとエラーで停止
 
 ### ポートのオーバーライド
 

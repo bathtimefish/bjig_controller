@@ -227,6 +227,10 @@ module.control(&json!({"clear_counts": "all"})).await?;
 
 ### Monitor Command
 
+The monitor command streams JSON uplink data from the router in real-time.
+
+#### Basic Usage
+
 ```rust
 // Monitor indefinitely (until Ctrl+C)
 bjig.monitor().start().await?;
@@ -234,6 +238,49 @@ bjig.monitor().start().await?;
 // Monitor with timeout (60 seconds)
 bjig.monitor().start_with_ttl(60).await?;
 ```
+
+#### Advanced Usage with Callback
+
+For more control over the monitoring process, you can use callback-based methods that allow you to process each JSON line as it arrives:
+
+```rust
+// Collect and process each JSON line
+let mut json_list: Vec<String> = Vec::new();
+
+bjig.monitor().start_with_callback(|line| {
+    // Print each line immediately
+    println!("Received: {}", line);
+
+    // Add to collection
+    json_list.push(line.to_string());
+
+    // Return Ok(true) to continue, Ok(false) to stop
+    Ok(json_list.len() < 5)  // Stop after 5 items
+}).await?;
+
+println!("Collected {} items", json_list.len());
+```
+
+```rust
+// With timeout and callback
+let mut json_list: Vec<String> = Vec::new();
+
+bjig.monitor().start_with_ttl_and_callback(120, |line| {
+    println!("Received: {}", line);
+    json_list.push(line.to_string());
+    Ok(json_list.len() < 5)  // Stop after 5 items or 120 seconds
+}).await?;
+```
+
+**Callback Methods:**
+- `start_with_callback(callback)` - Monitor with callback, no timeout
+- `start_with_callback_on(port, baud, callback)` - Monitor on specific port with callback
+- `start_with_ttl_and_callback(ttl_secs, callback)` - Monitor with timeout and callback
+
+The callback function receives each JSON line as `&str` and must return `Result<bool>`:
+- Return `Ok(true)` to continue monitoring
+- Return `Ok(false)` to stop monitoring and terminate the process
+- Return `Err(e)` to stop with an error
 
 ### Port Override
 
