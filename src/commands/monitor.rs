@@ -5,11 +5,19 @@ use crate::executor::CommandExecutor;
 use crate::types::Result;
 use tokio::sync::mpsc;
 
+/// Control messages for monitor process
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ControlMessage {
+    Stop,
+    Pause,
+    Resume,
+}
+
 /// Handle for controlling a running monitor process
 ///
 /// This handle allows external control of a monitor process, including
-/// graceful shutdown. The monitor will automatically stop when the handle
-/// is dropped or when explicitly stopped via `stop()`.
+/// graceful shutdown, pause, and resume. The monitor will automatically
+/// stop when the handle is dropped or when explicitly stopped via `stop()`.
 ///
 /// # Examples
 ///
@@ -22,7 +30,13 @@ use tokio::sync::mpsc;
 /// // Start monitor with handle
 /// let handle = bjig.monitor().start_with_handle().await?;
 ///
+/// // Pause monitor (stops callback processing)
+/// handle.pause().await?;
+///
 /// // Do some work...
+///
+/// // Resume monitor
+/// handle.resume().await?;
 ///
 /// // Stop monitor gracefully
 /// handle.stop().await?;
@@ -30,11 +44,46 @@ use tokio::sync::mpsc;
 /// # }
 /// ```
 pub struct MonitorHandle {
-    stop_tx: mpsc::Sender<()>,
+    control_tx: mpsc::Sender<ControlMessage>,
     task_handle: tokio::task::JoinHandle<Result<()>>,
 }
 
 impl MonitorHandle {
+    /// Pause the monitor
+    ///
+    /// This pauses callback processing. Data from the monitor process continues
+    /// to be received but callbacks are not invoked. When resumed, processing
+    /// continues with new data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the control channel is closed.
+    pub async fn pause(&self) -> Result<()> {
+        self.control_tx
+            .send(ControlMessage::Pause)
+            .await
+            .map_err(|_| crate::types::BjigError::CommandFailed("Failed to send pause signal".to_string()))?;
+        log::debug!("Pause signal sent to monitor");
+        Ok(())
+    }
+
+    /// Resume the monitor
+    ///
+    /// This resumes callback processing after a pause. The monitor will
+    /// continue processing new data received from the device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the control channel is closed.
+    pub async fn resume(&self) -> Result<()> {
+        self.control_tx
+            .send(ControlMessage::Resume)
+            .await
+            .map_err(|_| crate::types::BjigError::CommandFailed("Failed to send resume signal".to_string()))?;
+        log::debug!("Resume signal sent to monitor");
+        Ok(())
+    }
+
     /// Stop the monitor gracefully
     ///
     /// This sends a stop signal to the monitor process and waits for it
@@ -46,7 +95,7 @@ impl MonitorHandle {
     /// Returns an error if the monitor task panicked or failed.
     pub async fn stop(mut self) -> Result<()> {
         // Send stop signal (ignore error if already stopped)
-        let _ = self.stop_tx.send(()).await;
+        let _ = self.control_tx.send(ControlMessage::Stop).await;
 
         // Wait for task to complete
         match (&mut self.task_handle).await {
@@ -69,7 +118,7 @@ impl MonitorHandle {
 impl Drop for MonitorHandle {
     fn drop(&mut self) {
         // Send stop signal when handle is dropped (fire and forget)
-        let _ = self.stop_tx.try_send(());
+        let _ = self.control_tx.try_send(ControlMessage::Stop);
     }
 }
 
@@ -407,8 +456,8 @@ impl<'a> MonitorCommand<'a> {
         let default_baud = self.controller.default_baud;
         let port_owned = port.map(|s| s.to_string());
 
-        // Create channel for stop signal
-        let (stop_tx, stop_rx) = mpsc::channel(1);
+        // Create channel for control signals
+        let (control_tx, control_rx) = mpsc::channel(10);
 
         // Spawn monitor task
         let task_handle = tokio::spawn(async move {
@@ -426,12 +475,12 @@ impl<'a> MonitorCommand<'a> {
             let args: Vec<&str> = args_vec.iter().map(|s| s.as_str()).collect();
 
             executor
-                .execute_streaming_with_stopper(&args, port_owned.as_deref(), baud, stop_rx)
+                .execute_streaming_with_control(&args, port_owned.as_deref(), baud, control_rx)
                 .await
         });
 
         Ok(MonitorHandle {
-            stop_tx,
+            control_tx,
             task_handle,
         })
     }
@@ -452,8 +501,8 @@ impl<'a> MonitorCommand<'a> {
         let default_baud = self.controller.default_baud;
         let port_owned = port.map(|s| s.to_string());
 
-        // Create channel for stop signal
-        let (stop_tx, stop_rx) = mpsc::channel(1);
+        // Create channel for control signals
+        let (control_tx, control_rx) = mpsc::channel(10);
 
         // Spawn monitor task
         let task_handle = tokio::spawn(async move {
@@ -471,12 +520,12 @@ impl<'a> MonitorCommand<'a> {
             let args: Vec<&str> = args_vec.iter().map(|s| s.as_str()).collect();
 
             executor
-                .execute_streaming_with_callback_and_stopper(&args, port_owned.as_deref(), baud, callback, stop_rx)
+                .execute_streaming_with_callback_and_control(&args, port_owned.as_deref(), baud, callback, control_rx)
                 .await
         });
 
         Ok(MonitorHandle {
-            stop_tx,
+            control_tx,
             task_handle,
         })
     }

@@ -2,14 +2,16 @@
 //!
 //! This example demonstrates how to combine callback functionality with
 //! external control via handle. The callback processes each JSON line,
-//! and the handle allows stopping the monitor from external code.
+//! and the handle allows pausing, resuming, and stopping the monitor
+//! from external code.
 //!
 //! # How it works
 //!
 //! 1. Start monitor with `start_with_callback_and_handle()`
 //! 2. Callback processes each received JSON line
 //! 3. Counter tracks number of received messages
-//! 4. External code can stop monitor via handle at any time
+//! 4. External code can pause/resume/stop monitor via handle at any time
+//! 5. When paused, callback is not invoked but data continues to be buffered
 //!
 //! # Usage
 //!
@@ -28,11 +30,16 @@
 //! === BraveJIG Monitor with Callback and Handle Example ===
 //!
 //! Starting monitor with callback and handle...
-//! Monitor started, will stop after 5 messages or 30 seconds...
+//! Monitor started, will pause after 3 messages...
 //!
 //! [1] Received: {"sensor_id":"0121",...}
 //! [2] Received: {"sensor_id":"0121",...}
 //! [3] Received: {"sensor_id":"0121",...}
+//!
+//! Pausing monitor for 3 seconds...
+//! (no callback invocations during pause)
+//!
+//! Resuming monitor...
 //! [4] Received: {"sensor_id":"0121",...}
 //! [5] Received: {"sensor_id":"0121",...}
 //!
@@ -76,10 +83,36 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
 
-    println!("Monitor started, will stop after 5 messages or 30 seconds...\n");
+    println!("Monitor started, will pause after 3 messages...\n");
 
-    // Poll until we receive 5 messages or 30 seconds timeout
-    let result = timeout(Duration::from_secs(30), async {
+    // Wait for 3 messages
+    timeout(Duration::from_secs(30), async {
+        loop {
+            sleep(Duration::from_millis(100)).await;
+            let count = *message_count.lock().unwrap();
+            if count >= 3 {
+                break;
+            }
+        }
+    })
+    .await
+    .ok();
+
+    // Pause monitor
+    println!("\nPausing monitor for 3 seconds...");
+    handle.pause().await?;
+    println!("Monitor paused (callback not invoked, data buffered)\n");
+
+    // Wait while paused
+    sleep(Duration::from_secs(3)).await;
+
+    // Resume monitor
+    println!("Resuming monitor...");
+    handle.resume().await?;
+    println!("Monitor resumed (buffered data will be processed)\n");
+
+    // Wait for 2 more messages (total 5)
+    timeout(Duration::from_secs(30), async {
         loop {
             sleep(Duration::from_millis(100)).await;
             let count = *message_count.lock().unwrap();
@@ -88,21 +121,15 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     })
-    .await;
+    .await
+    .ok();
 
     let final_count = *message_count.lock().unwrap();
 
-    match result {
-        Ok(_) => {
-            println!(
-                "\nReceived {} messages, stopping monitor...",
-                final_count
-            );
-        }
-        Err(_) => {
-            println!("\n30 second timeout reached, stopping monitor...");
-        }
-    }
+    println!(
+        "\nReceived {} messages, stopping monitor...",
+        final_count
+    );
 
     // Stop monitor
     handle.stop().await?;

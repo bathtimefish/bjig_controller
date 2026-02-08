@@ -146,6 +146,43 @@ cargo run --example monitor_with_ttl
 
 **Expected behavior:** The example will collect up to 5 JSON uplink messages or stop after 120 seconds, whichever comes first.
 
+### 7. `monitor_with_handle.rs`
+
+Real-time monitoring with external control via handle, demonstrating pause/resume functionality.
+
+**What it demonstrates:**
+- Starting monitor with a handle for external control
+- Pausing monitor (callback processing stops, data buffered by router)
+- Resuming monitor (buffered data is received)
+- Stopping monitor gracefully
+- Handle-based control allows flexible monitoring workflows
+
+**Usage:**
+```bash
+cargo run --example monitor_with_handle
+```
+
+**Expected behavior:** Monitor runs for 5 seconds, pauses for 3 seconds, resumes for 5 seconds, then stops. During pause, no output is shown but the router continues buffering data.
+
+### 8. `monitor_with_callback_and_handle.rs`
+
+Combines callback processing with pause/resume control via handle.
+
+**What it demonstrates:**
+- Starting monitor with both callback and handle
+- Processing each JSON line with a callback
+- Counting messages received
+- Pausing callback processing while data is buffered
+- Resuming callback processing
+- External control of callback-based monitoring
+
+**Usage:**
+```bash
+cargo run --example monitor_with_callback_and_handle
+```
+
+**Expected behavior:** Receives 3 messages, pauses for 3 seconds (callback not invoked), resumes and receives 2 more messages, then stops. Total of 5 messages processed.
+
 ## Common Issues
 
 ### "No such file or directory" or "bjig not found"
@@ -191,7 +228,9 @@ Recommended order for understanding the library:
 3. Experiment with `module_control.rs` if you have sensors connected
 4. Use `restart_router.rs` to learn restart sequences
 5. Explore `monitor.rs` for real-time data collection
-6. Advanced: `monitor_with_ttl.rs` for timeout-based monitoring
+6. Learn `monitor_with_ttl.rs` for timeout-based monitoring
+7. Advanced: `monitor_with_handle.rs` for external control with pause/resume
+8. Advanced: `monitor_with_callback_and_handle.rs` for callback-based monitoring with control
 
 ## Additional Resources
 

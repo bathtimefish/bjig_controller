@@ -5,6 +5,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+use crate::commands::monitor::ControlMessage;
 use crate::env::{resolve_baud, resolve_port};
 use crate::types::{BjigError, Result};
 
@@ -237,6 +238,95 @@ impl<'a> CommandExecutor<'a> {
         Ok(())
     }
 
+    /// Execute bjig command and stream stdout with control messages (stop/pause/resume)
+    ///
+    /// This variant allows external code to control the streaming with pause/resume/stop.
+    /// When paused, data continues to be read but is not printed.
+    ///
+    /// # Arguments
+    /// * `args` - Command arguments
+    /// * `port_override` - Optional port override
+    /// * `baud_override` - Optional baud override
+    /// * `control_rx` - Receiver for control messages
+    pub async fn execute_streaming_with_control(
+        &self,
+        args: &[&str],
+        port_override: Option<&str>,
+        baud_override: Option<u32>,
+        mut control_rx: mpsc::Receiver<ControlMessage>,
+    ) -> Result<()> {
+        let full_args = self.build_args(args, port_override, baud_override)?;
+        log::debug!("Executing (streaming with control): {:?} {:?}", self.bjig_path, full_args);
+
+        let mut child = Command::new(self.bjig_path)
+            .args(&full_args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                log::error!("Failed to spawn bjig command: {}", e);
+                e
+            })?;
+
+        let mut paused = false;
+        let mut stopped = false;
+
+        // Stream stdout
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+
+            loop {
+                tokio::select! {
+                    // Line received from monitor
+                    line_result = lines.next_line() => {
+                        match line_result? {
+                            Some(line) => {
+                                if !paused {
+                                    println!("{}", line);
+                                }
+                                // If paused, data is discarded (router buffers it)
+                            }
+                            None => break,
+                        }
+                    }
+                    // Control signal received
+                    msg = control_rx.recv() => {
+                        match msg {
+                            Some(ControlMessage::Stop) => {
+                                log::info!("Stop signal received, terminating monitor");
+                                stopped = true;
+                                break;
+                            }
+                            Some(ControlMessage::Pause) => {
+                                log::info!("Pause signal received");
+                                paused = true;
+                            }
+                            Some(ControlMessage::Resume) => {
+                                log::info!("Resume signal received");
+                                paused = false;
+                            }
+                            None => {
+                                log::debug!("Control channel closed");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Kill the child process
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+
+        if stopped {
+            log::debug!("Streaming stopped by control signal");
+        }
+
+        Ok(())
+    }
+
     /// Execute bjig command and stream stdout with callback and external stop signal
     ///
     /// Combines callback functionality with external stop control.
@@ -312,6 +402,107 @@ impl<'a> CommandExecutor<'a> {
 
         if stopped_externally {
             log::debug!("Streaming stopped by external signal");
+        } else if !should_continue {
+            log::debug!("Streaming stopped by callback");
+        }
+
+        Ok(())
+    }
+
+    /// Execute bjig command and stream stdout with callback and control messages
+    ///
+    /// Combines callback functionality with pause/resume/stop control.
+    /// When paused, data continues to be read but callback is not invoked.
+    ///
+    /// # Arguments
+    /// * `args` - Command arguments
+    /// * `port_override` - Optional port override
+    /// * `baud_override` - Optional baud override
+    /// * `callback` - Function called for each line. Returns Ok(true) to continue, Ok(false) to stop.
+    /// * `control_rx` - Receiver for control messages
+    pub async fn execute_streaming_with_callback_and_control<F>(
+        &self,
+        args: &[&str],
+        port_override: Option<&str>,
+        baud_override: Option<u32>,
+        mut callback: F,
+        mut control_rx: mpsc::Receiver<ControlMessage>,
+    ) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<bool>,
+    {
+        let full_args = self.build_args(args, port_override, baud_override)?;
+        log::debug!("Executing (streaming with callback and control): {:?} {:?}", self.bjig_path, full_args);
+
+        let mut child = Command::new(self.bjig_path)
+            .args(&full_args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                log::error!("Failed to spawn bjig command: {}", e);
+                e
+            })?;
+
+        let mut should_continue = true;
+        let mut paused = false;
+        let mut stopped = false;
+
+        // Stream stdout
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+
+            loop {
+                tokio::select! {
+                    // Line received from monitor
+                    line_result = lines.next_line() => {
+                        let line_opt: Option<String> = line_result?;
+                        match line_opt {
+                            Some(line) => {
+                                if !paused {
+                                    should_continue = callback(&line)?;
+                                    if !should_continue {
+                                        break;
+                                    }
+                                }
+                                // If paused, data is discarded (router buffers it)
+                            }
+                            None => break,
+                        }
+                    }
+                    // Control signal received
+                    msg = control_rx.recv() => {
+                        match msg {
+                            Some(ControlMessage::Stop) => {
+                                log::info!("Stop signal received, terminating monitor");
+                                stopped = true;
+                                break;
+                            }
+                            Some(ControlMessage::Pause) => {
+                                log::info!("Pause signal received");
+                                paused = true;
+                            }
+                            Some(ControlMessage::Resume) => {
+                                log::info!("Resume signal received");
+                                paused = false;
+                            }
+                            None => {
+                                log::debug!("Control channel closed");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Kill the child process
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+
+        if stopped {
+            log::debug!("Streaming stopped by control signal");
         } else if !should_continue {
             log::debug!("Streaming stopped by callback");
         }
