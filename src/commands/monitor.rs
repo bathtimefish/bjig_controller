@@ -3,6 +3,75 @@
 use crate::controller::BjigController;
 use crate::executor::CommandExecutor;
 use crate::types::Result;
+use tokio::sync::mpsc;
+
+/// Handle for controlling a running monitor process
+///
+/// This handle allows external control of a monitor process, including
+/// graceful shutdown. The monitor will automatically stop when the handle
+/// is dropped or when explicitly stopped via `stop()`.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn example() -> anyhow::Result<()> {
+/// use bjig_controller::BjigController;
+///
+/// let bjig = BjigController::from_env()?;
+///
+/// // Start monitor with handle
+/// let handle = bjig.monitor().start_with_handle().await?;
+///
+/// // Do some work...
+///
+/// // Stop monitor gracefully
+/// handle.stop().await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct MonitorHandle {
+    stop_tx: mpsc::Sender<()>,
+    task_handle: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl MonitorHandle {
+    /// Stop the monitor gracefully
+    ///
+    /// This sends a stop signal to the monitor process and waits for it
+    /// to terminate. The method consumes the handle to ensure it can only
+    /// be called once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the monitor task panicked or failed.
+    pub async fn stop(mut self) -> Result<()> {
+        // Send stop signal (ignore error if already stopped)
+        let _ = self.stop_tx.send(()).await;
+
+        // Wait for task to complete
+        match (&mut self.task_handle).await {
+            Ok(result) => result,
+            Err(e) => {
+                log::error!("Monitor task panicked: {}", e);
+                Err(crate::types::BjigError::CommandFailed(format!("Monitor task panicked: {}", e)))
+            }
+        }
+    }
+
+    /// Check if monitor is still running
+    ///
+    /// Returns `true` if the monitor process is still active, `false` otherwise.
+    pub fn is_running(&self) -> bool {
+        !self.task_handle.is_finished()
+    }
+}
+
+impl Drop for MonitorHandle {
+    fn drop(&mut self) {
+        // Send stop signal when handle is dropped (fire and forget)
+        let _ = self.stop_tx.try_send(());
+    }
+}
 
 /// Monitor command interface
 ///
@@ -144,6 +213,134 @@ impl<'a> MonitorCommand<'a> {
             .await
     }
 
+    /// Start monitoring with handle for external control
+    ///
+    /// Returns a `MonitorHandle` that can be used to stop the monitor
+    /// from external code. The monitor runs in a background task.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> anyhow::Result<()> {
+    /// use bjig_controller::BjigController;
+    /// use tokio::time::{sleep, Duration};
+    ///
+    /// let bjig = BjigController::from_env()?;
+    ///
+    /// // Start monitor with handle
+    /// let handle = bjig.monitor().start_with_handle().await?;
+    ///
+    /// // Let it run for 5 seconds
+    /// sleep(Duration::from_secs(5)).await;
+    ///
+    /// // Stop gracefully
+    /// handle.stop().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn start_with_handle(&self) -> Result<MonitorHandle> {
+        self.start_with_handle_impl(None, None, None).await
+    }
+
+    /// Start monitoring on specific port with handle
+    pub async fn start_with_handle_on(&self, port: &str, baud: u32) -> Result<MonitorHandle> {
+        self.start_with_handle_impl(Some(port), Some(baud), None)
+            .await
+    }
+
+    /// Start monitoring with TTL and handle
+    ///
+    /// # Arguments
+    /// * `ttl_secs` - Time to live in seconds
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> anyhow::Result<()> {
+    /// use bjig_controller::BjigController;
+    ///
+    /// let bjig = BjigController::from_env()?;
+    ///
+    /// // Monitor for max 60 seconds, but can be stopped early
+    /// let handle = bjig.monitor().start_with_ttl_and_handle(60).await?;
+    ///
+    /// // Stop before TTL expires
+    /// handle.stop().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn start_with_ttl_and_handle(&self, ttl_secs: u64) -> Result<MonitorHandle> {
+        self.start_with_handle_impl(None, None, Some(ttl_secs))
+            .await
+    }
+
+    /// Start monitoring with callback and handle
+    ///
+    /// Combines callback functionality with external control via handle.
+    /// The callback receives each line and can stop monitoring by returning
+    /// `Ok(false)`. The handle can also be used to stop from external code.
+    ///
+    /// # Arguments
+    /// * `callback` - Function called for each line. Returns Ok(true) to continue, Ok(false) to stop.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> anyhow::Result<()> {
+    /// use bjig_controller::BjigController;
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// let bjig = BjigController::from_env()?;
+    /// let count = Arc::new(Mutex::new(0));
+    /// let count_clone = count.clone();
+    ///
+    /// let handle = bjig.monitor().start_with_callback_and_handle(move |line| {
+    ///     println!("Received: {}", line);
+    ///     let mut c = count_clone.lock().unwrap();
+    ///     *c += 1;
+    ///     Ok(true) // Continue
+    /// }).await?;
+    ///
+    /// // Stop from external code when needed
+    /// handle.stop().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn start_with_callback_and_handle<F>(&self, callback: F) -> Result<MonitorHandle>
+    where
+        F: FnMut(&str) -> Result<bool> + Send + 'static,
+    {
+        self.start_with_callback_and_handle_impl(None, None, None, callback)
+            .await
+    }
+
+    /// Start monitoring on specific port with callback and handle
+    pub async fn start_with_callback_and_handle_on<F>(
+        &self,
+        port: &str,
+        baud: u32,
+        callback: F,
+    ) -> Result<MonitorHandle>
+    where
+        F: FnMut(&str) -> Result<bool> + Send + 'static,
+    {
+        self.start_with_callback_and_handle_impl(Some(port), Some(baud), None, callback)
+            .await
+    }
+
+    /// Start monitoring with TTL, callback, and handle
+    pub async fn start_with_ttl_callback_and_handle<F>(
+        &self,
+        ttl_secs: u64,
+        callback: F,
+    ) -> Result<MonitorHandle>
+    where
+        F: FnMut(&str) -> Result<bool> + Send + 'static,
+    {
+        self.start_with_callback_and_handle_impl(None, None, Some(ttl_secs), callback)
+            .await
+    }
+
     async fn start_on_impl(
         &self,
         port: Option<&str>,
@@ -196,5 +393,91 @@ impl<'a> MonitorCommand<'a> {
             .await?;
 
         Ok(())
+    }
+
+    async fn start_with_handle_impl(
+        &self,
+        port: Option<&str>,
+        baud: Option<u32>,
+        ttl_secs: Option<u64>,
+    ) -> Result<MonitorHandle> {
+        // Clone necessary data to move into task
+        let bjig_path = self.controller.bjig_path.clone();
+        let default_port = self.controller.default_port.clone();
+        let default_baud = self.controller.default_baud;
+        let port_owned = port.map(|s| s.to_string());
+
+        // Create channel for stop signal
+        let (stop_tx, stop_rx) = mpsc::channel(1);
+
+        // Spawn monitor task
+        let task_handle = tokio::spawn(async move {
+            let executor = CommandExecutor::new(
+                &bjig_path,
+                default_port.as_deref(),
+                default_baud,
+            );
+
+            let mut args_vec = vec!["monitor".to_string()];
+            if let Some(ttl) = ttl_secs {
+                args_vec.push("--ttl".to_string());
+                args_vec.push(ttl.to_string());
+            }
+            let args: Vec<&str> = args_vec.iter().map(|s| s.as_str()).collect();
+
+            executor
+                .execute_streaming_with_stopper(&args, port_owned.as_deref(), baud, stop_rx)
+                .await
+        });
+
+        Ok(MonitorHandle {
+            stop_tx,
+            task_handle,
+        })
+    }
+
+    async fn start_with_callback_and_handle_impl<F>(
+        &self,
+        port: Option<&str>,
+        baud: Option<u32>,
+        ttl_secs: Option<u64>,
+        callback: F,
+    ) -> Result<MonitorHandle>
+    where
+        F: FnMut(&str) -> Result<bool> + Send + 'static,
+    {
+        // Clone necessary data to move into task
+        let bjig_path = self.controller.bjig_path.clone();
+        let default_port = self.controller.default_port.clone();
+        let default_baud = self.controller.default_baud;
+        let port_owned = port.map(|s| s.to_string());
+
+        // Create channel for stop signal
+        let (stop_tx, stop_rx) = mpsc::channel(1);
+
+        // Spawn monitor task
+        let task_handle = tokio::spawn(async move {
+            let executor = CommandExecutor::new(
+                &bjig_path,
+                default_port.as_deref(),
+                default_baud,
+            );
+
+            let mut args_vec = vec!["monitor".to_string()];
+            if let Some(ttl) = ttl_secs {
+                args_vec.push("--ttl".to_string());
+                args_vec.push(ttl.to_string());
+            }
+            let args: Vec<&str> = args_vec.iter().map(|s| s.as_str()).collect();
+
+            executor
+                .execute_streaming_with_callback_and_stopper(&args, port_owned.as_deref(), baud, callback, stop_rx)
+                .await
+        });
+
+        Ok(MonitorHandle {
+            stop_tx,
+            task_handle,
+        })
     }
 }

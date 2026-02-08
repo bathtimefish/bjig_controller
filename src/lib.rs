@@ -56,6 +56,7 @@ pub mod types;
 
 // Re-export main types
 pub use controller::BjigController;
+pub use commands::monitor::MonitorHandle;
 pub use types::*;
 
 // Re-export environment constants for user reference
